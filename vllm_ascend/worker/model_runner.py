@@ -38,11 +38,13 @@ from vllm.inputs import INPUT_REGISTRY, InputRegistry
 from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping
 from vllm.lora.request import LoRARequest
+from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
 from vllm.model_executor import SamplingMetadata, SamplingMetadataCache
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
+from vllm.model_executor.models import supports_lora, supports_multimodal
 from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
 from vllm.multimodal import (MULTIMODAL_REGISTRY, BatchedTensorInputs,
                              MultiModalKwargs, MultiModalPlaceholderMap,
@@ -792,6 +794,8 @@ class NPUModelRunnerBase(ModelRunnerBase[TModelInputForNPU]):
 
         # Lazy initialization
         self.model: nn.Module  # Set after load_model
+        # Set after load_model.
+        self.lora_manager: Optional[LRUCacheWorkerLoRAManager] = None
 
         set_cpu_offload_max_bytes(
             int(self.cache_config.cpu_offload_gb * 1024**3))
@@ -820,6 +824,34 @@ class NPUModelRunnerBase(ModelRunnerBase[TModelInputForNPU]):
         self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB",
                     self.model_memory_usage / float(2**30))
+
+        if self.lora_config:
+            assert supports_lora(
+                self.model
+            ), f"{self.model.__class__.__name__} does not support LoRA yet."
+
+            if supports_multimodal(self.model):
+                logger.warning("Regarding multimodal models, vLLM currently "
+                               "only supports adding LoRA to language model.")
+            # It's necessary to distinguish between the max_position_embeddings
+            # of VLMs and LLMs.
+            if hasattr(self.model.config, "max_position_embeddings"):
+                max_pos_embeddings = self.model.config.max_position_embeddings
+            else:
+                max_pos_embeddings = (
+                    self.model.config.text_config.max_position_embeddings)
+
+            self.lora_manager = LRUCacheWorkerLoRAManager(
+                self.scheduler_config.max_num_seqs,
+                self.scheduler_config.max_num_batched_tokens,
+                self.vocab_size,
+                self.lora_config,
+                self.device,
+                self.model.embedding_modules,
+                self.model.embedding_padding_modules,
+                max_position_embeddings=max_pos_embeddings,
+            )
+            self.model = self.lora_manager.create_lora_manager(self.model)
 
     def save_sharded_state(
         self,
@@ -977,16 +1009,24 @@ class NPUModelRunnerBase(ModelRunnerBase[TModelInputForNPU]):
         raise RuntimeError("LoRA is not supported on NPU now.")
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
-        raise RuntimeError("LoRA is not supported on NPU now.")
+        if not self.lora_manager:
+            raise RuntimeError("LoRA is not enabled.")
+        return self.lora_manager.add_adapter(lora_request)
 
     def remove_lora(self, lora_id: int) -> bool:
-        raise RuntimeError("LoRA is not supported on NPU now.")
+        if not self.lora_manager:
+            raise RuntimeError("LoRA is not enabled.")
+        return self.lora_manager.remove_adapter(lora_id)
 
     def pin_lora(self, lora_id: int) -> bool:
-        raise RuntimeError("LoRA is not supported on NPU now.")
+        if not self.lora_manager:
+            raise RuntimeError("LoRA is not enabled.")
+        return self.lora_manager.pin_adapter(lora_id)
 
     def list_loras(self) -> Set[int]:
-        raise RuntimeError("LoRA is not supported on NPU now.")
+        if not self.lora_manager:
+            raise RuntimeError("LoRA is not enabled.")
+        return self.lora_manager.list_adapters()
 
     def remove_all_prompt_adapters(self):
         raise RuntimeError("PromptAdapter is not supported on NPU now.")

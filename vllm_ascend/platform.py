@@ -135,6 +135,11 @@ class NPUPlatform(Platform):
         return "vllm_ascend.attention.AscendAttentionBackend"
 
     @classmethod
+    def get_punica_wrapper(cls) -> str:
+        print("vllm-ascend: vllm_ascend.punica_wrapper.punica_npu.PunicaWrapperNPU")
+        return "vllm_ascend.punica_wrapper.punica_npu.PunicaWrapperNPU"
+
+    @classmethod
     def get_current_memory_usage(cls,
                                  device: Optional[torch.types.Device] = None
                                  ) -> float:
