@@ -33,6 +33,11 @@ while [[ $# -gt 0 ]]; do
             DECODE_DEVICE_CNT="$1"
             shift
             ;;
+        --device-id-list)
+            shift
+            DEVICE_ID_LIST="$1"
+            shift
+            ;;
     esac
 done
 LOCAL_HOSTS=($(hostname -I))
@@ -68,6 +73,11 @@ echo "NNODES": $NNODES
 echo "NODE_RANK": $NODE_RANK
 echo "==============="
 
+DEVICE_ID_LIST_SECTION=""
+if [ -n "$DEVICE_ID_LIST" ]; then
+  DEVICE_ID_LIST_SECTION=" --device-id-list $DEVICE_ID_LIST"
+fi
+
 if [[ -n "${GEN_RANKTABLE}" || ! -e ${PWD}/ranktable.json ]]; then
     GLOO_SOCKET_IFNAME=$NETWORK_CARD_NAME torchrun \
         --nproc_per_node 1 \
@@ -75,5 +85,5 @@ if [[ -n "${GEN_RANKTABLE}" || ! -e ${PWD}/ranktable.json ]]; then
         --node_rank ${NODE_RANK} \
         --master_addr ${MASTER_ADDR} \
         --master_port ${MASTER_PORT} \
-        gen_ranktable.py --local-host $LOCAL_HOST --prefill-device-cnt $PREFILL_DEVICE_CNT --decode-device-cnt $DECODE_DEVICE_CNT
+        gen_ranktable.py --local-host $LOCAL_HOST --prefill-device-cnt $PREFILL_DEVICE_CNT --decode-device-cnt $DECODE_DEVICE_CNT $DEVICE_ID_LIST_SECTION
 fi
