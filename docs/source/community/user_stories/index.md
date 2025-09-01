@@ -16,4 +16,5 @@ Read case studies on how users and developers solves real, everyday problems wit
 :caption: More details
 :maxdepth: 1
 llamafactory
+cmb
 :::
