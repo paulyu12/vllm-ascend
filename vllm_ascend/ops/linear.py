@@ -434,6 +434,13 @@ class AscendReplicatedLinear(ReplicatedLinear):
         disable_tp: bool = False,
     ):
         self.custom_op = get_replicated_op(disable_tp, prefix, self)
+        if self.custom_op is not None:
+            self.tp_size = self.custom_op.tp_size
+            self.tp_rank = self.custom_op.tp_rank
+        else:
+            self.tp_size = 1
+            self.tp_rank = 0
+
         # If MergedReplicatedLinear, use output size of each partition.
         if hasattr(self, "output_sizes"):
             self.output_partition_sizes = self.output_sizes
