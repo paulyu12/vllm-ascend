@@ -126,7 +126,6 @@ def generate_and_test(llm, llama32_lora_files, tensorizer_config_dict: dict | No
     print("removing lora")
 
 
-@pytest.mark.skip(reason="fix me")
 @patch.dict("os.environ", {"VLLM_USE_MODELSCOPE": "False"})
 def test_llama_lora(llama32_lora_files):
     vllm_model = VllmRunner(
