@@ -77,6 +77,11 @@ class NPUModelRunner(GPUModelRunner):
 
         # AscendRequestState has extra `num_computed_tokens_cpu` attribute.
         # so reinitialize req_states here.
+        use_strict_rejection_sampling = False
+        if self.speculative_config is not None:
+            use_strict_rejection_sampling = (
+                self.speculative_config.rejection_sample_method == "strict"
+            )
         self.req_states: AscendRequestState = AscendRequestState(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
@@ -84,6 +89,8 @@ class NPUModelRunner(GPUModelRunner):
             num_speculative_steps=self.num_speculative_steps,
             vocab_size=self.vocab_size,
             device=self.device,
+            model_dtype=self.dtype,
+            cache_draft_logits=not use_strict_rejection_sampling,
         )
         # AscendInputBuffers has extra `seq_lens_cpu` attribute.
         # so reinitialize input_buffers here.
@@ -352,6 +359,31 @@ class NPUModelRunner(GPUModelRunner):
             req_index = self.req_states.req_id_to_index[req_id]
             num_computed_tokens = self.req_states.num_computed_tokens_cpu[req_index]
             self.input_buffers.seq_lens_cpu[i] = num_computed_tokens + num_scheduled_tokens[req_id]
+
+    @torch.inference_mode()
+    def profile_run(self) -> None:
+        """Override profile_run to set up dummy LoRA state before profiling.
+
+        During profile_run, the model's LoRA layers are called. Without
+        initializing the punica wrapper's index tensors, the LoRA kernels
+        receive uninitialized indices and may fail on NPU. We set up dummy
+        LoRA with num_active_loras=0 so that no_lora=True and all LoRA
+        kernel calls are safely skipped during profiling.
+        """
+        if self.lora_config:
+            num_reqs = min(self.max_num_tokens, self.max_num_reqs)
+            dummy_scheduled = np.ones(num_reqs, dtype=np.int32)
+            dummy_sampled = np.ones(num_reqs, dtype=np.int32)
+            with self.maybe_dummy_run_with_lora(
+                self.lora_config,
+                dummy_scheduled,
+                dummy_sampled,
+                remove_lora=True,
+                num_active_loras=0,
+            ):
+                super().profile_run()
+        else:
+            super().profile_run()
 
     def eplb_warmup(self):
         # TODO(Ronald1995): just define the method in case calling error in
