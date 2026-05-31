@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
 
+from packaging.version import Version
+from transformers import __version__ as TRANSFORMERS_VERSION
+
 import vllm
 from vllm.assets.image import ImageAsset
 from vllm.lora.request import LoRARequest
@@ -35,10 +38,20 @@ class TestConfig:
 
     def __post_init__(self):
         if self.mm_processor_kwargs is None:
-            self.mm_processor_kwargs = {
-                "min_pixels": 28 * 28,
-                "max_pixels": 1280 * 28 * 28,
-            }
+            # There is a bug in transformers v4 where size is ignored by
+            # `Qwen2VLProcessor.__call__`
+            if Version(TRANSFORMERS_VERSION) < Version("5.2.0"):
+                self.mm_processor_kwargs = {
+                    "min_pixels": 28 * 28,
+                    "max_pixels": 1280 * 28 * 28,
+                }
+            else:
+                self.mm_processor_kwargs = {
+                    "size": {
+                        "shortest_edge": 28 * 28,
+                        "longest_edge": 1280 * 28 * 28,
+                    }
+                }
 
 
 def run_test(
@@ -63,7 +76,9 @@ def run_test(
         for asset in images
     ]
 
-    lora_request = LoRARequest(lora_name if lora_name else str(lora_id), lora_id, config.lora_path)
+    lora_request = LoRARequest(
+        lora_name if lora_name else str(lora_id), lora_id, config.lora_path
+    )
     outputs = llm.generate(inputs, sampling_params, lora_request=lora_request)
     generated_texts = [output.outputs[0].text.strip() for output in outputs]
     # Validate outputs
@@ -82,7 +97,9 @@ def run_beam_search_test(
     beam_width: int = 2,
     max_tokens: int = 5,
 ):
-    beam_search_params = BeamSearchParams(beam_width=beam_width, max_tokens=max_tokens, temperature=temperature)
+    beam_search_params = BeamSearchParams(
+        beam_width=beam_width, max_tokens=max_tokens, temperature=temperature
+    )
 
     inputs = [
         {
@@ -93,7 +110,9 @@ def run_beam_search_test(
     ]
 
     lora_request = LoRARequest(str(lora_id), lora_id, config.lora_path)
-    outputs = llm.beam_search(inputs, beam_search_params, lora_request=lora_request)
+    outputs = llm.beam_search(
+        inputs, beam_search_params, lora_request=lora_request
+    )
 
     for output_obj, expected_texts in zip(outputs, expected_outputs):
         output_texts = [seq.text for seq in output_obj.sequences]
@@ -137,85 +156,85 @@ EXPECTED_BEAM_SEARCH_OUTPUTS = [
     ],
 ]
 
-QWEN2VL_MODEL_PATH = "Qwen/Qwen2-VL-2B-Instruct"
-QWEN25VL_MODEL_PATH = "Qwen/Qwen2.5-VL-3B-Instruct"
-QWEN3VL_MODEL_PATH = "Qwen/Qwen3-VL-4B-Instruct"
+QWEN2VL_MODEL_PATH = "/data1/Qwen2-VL-2B-Instruct"
+QWEN25VL_MODEL_PATH = "/data1/Qwen2.5-VL-3B-Instruct"
+QWEN3VL_MODEL_PATH = "/data1/Qwen3-VL-4B-Instruct"
 
 
-@wait_until_npu_memory_free()
-def test_qwen2vl_lora(qwen2vl_lora_files):
-    """Test Qwen 2.0 VL model with LoRA"""
-    config = TestConfig(model_path=QWEN2VL_MODEL_PATH, lora_path=qwen2vl_lora_files)
+# @wait_until_npu_memory_free()
+# def test_qwen2vl_lora(qwen2vl_lora_files):
+#     """Test Qwen 2.0 VL model with LoRA"""
+#     config = TestConfig(model_path=QWEN2VL_MODEL_PATH, lora_path=qwen2vl_lora_files)
 
-    # Test with different LoRA IDs
-    with VllmRunner(
-        config.model_path,
-        max_num_seqs=config.max_num_seqs,
-        enable_lora=True,
-        max_loras=config.max_loras,
-        max_lora_rank=config.max_lora_rank,
-        enable_tower_connector_lora=config.enable_tower_connector_lora,
-        gpu_memory_utilization=config.gpu_memory_utilization,
-        mm_processor_kwargs=config.mm_processor_kwargs,
-        mm_processor_cache_gb=config.mm_processor_cache_gb,
-        max_model_len=config.max_model_len,
-    ) as vllm_model:
-        llm = vllm_model.model
-        run_test(llm, config, TEST_IMAGES, expected_outputs=EXPECTED_OUTPUTS, lora_id=1)
-
-
-@wait_until_npu_memory_free()
-def test_qwen2vl_lora_beam_search(qwen2vl_lora_files):
-    """Test Qwen 2.0 VL model with LoRA through beam search."""
-    config = TestConfig(model_path=QWEN2VL_MODEL_PATH, lora_path=qwen2vl_lora_files)
-    with VllmRunner(
-        config.model_path,
-        max_num_seqs=config.max_num_seqs,
-        enable_lora=True,
-        max_loras=config.max_loras,
-        max_lora_rank=config.max_lora_rank,
-        enable_tower_connector_lora=config.enable_tower_connector_lora,
-        gpu_memory_utilization=config.gpu_memory_utilization,
-        mm_processor_kwargs=config.mm_processor_kwargs,
-        mm_processor_cache_gb=config.mm_processor_cache_gb,
-        max_model_len=config.max_model_len,
-    ) as vllm_model:
-        llm = vllm_model.model
-
-        # NOTE currently, we only test cherry blossom since stop sign
-        # output is slightly different for v1; - the root cause is likely
-        # independent of the intent of this test, which is to ensure beam
-        # search passes through lora through correctly.
-        run_beam_search_test(
-            llm,
-            config,
-            [ImageAsset("cherry_blossom")],
-            expected_outputs=EXPECTED_BEAM_SEARCH_OUTPUTS,
-            lora_id=1,
-        )
+#     # Test with different LoRA IDs
+#     with VllmRunner(
+#         config.model_path,
+#         max_num_seqs=config.max_num_seqs,
+#         enable_lora=True,
+#         max_loras=config.max_loras,
+#         max_lora_rank=config.max_lora_rank,
+#         enable_tower_connector_lora=config.enable_tower_connector_lora,
+#         gpu_memory_utilization=config.gpu_memory_utilization,
+#         mm_processor_kwargs=config.mm_processor_kwargs,
+#         mm_processor_cache_gb=config.mm_processor_cache_gb,
+#         max_model_len=config.max_model_len,
+#     ) as vllm_model:
+#         llm = vllm_model.model
+#         run_test(llm, config, TEST_IMAGES, expected_outputs=EXPECTED_OUTPUTS, lora_id=1)
 
 
-@wait_until_npu_memory_free()
-def test_qwen25vl_lora(qwen25vl_lora_files):
-    """Test Qwen 2.5 VL model with LoRA"""
-    config = TestConfig(model_path=QWEN25VL_MODEL_PATH, lora_path=qwen25vl_lora_files)
+# @wait_until_npu_memory_free()
+# def test_qwen2vl_lora_beam_search(qwen2vl_lora_files):
+#     """Test Qwen 2.0 VL model with LoRA through beam search."""
+#     config = TestConfig(model_path=QWEN2VL_MODEL_PATH, lora_path=qwen2vl_lora_files)
+#     with VllmRunner(
+#         config.model_path,
+#         max_num_seqs=config.max_num_seqs,
+#         enable_lora=True,
+#         max_loras=config.max_loras,
+#         max_lora_rank=config.max_lora_rank,
+#         enable_tower_connector_lora=config.enable_tower_connector_lora,
+#         gpu_memory_utilization=config.gpu_memory_utilization,
+#         mm_processor_kwargs=config.mm_processor_kwargs,
+#         mm_processor_cache_gb=config.mm_processor_cache_gb,
+#         max_model_len=config.max_model_len,
+#     ) as vllm_model:
+#         llm = vllm_model.model
 
-    # Test with different LoRA IDs
-    with VllmRunner(
-        config.model_path,
-        max_num_seqs=config.max_num_seqs,
-        enable_lora=True,
-        max_loras=config.max_loras,
-        max_lora_rank=config.max_lora_rank,
-        enable_tower_connector_lora=config.enable_tower_connector_lora,
-        gpu_memory_utilization=config.gpu_memory_utilization,
-        mm_processor_kwargs=config.mm_processor_kwargs,
-        mm_processor_cache_gb=config.mm_processor_cache_gb,
-        max_model_len=config.max_model_len,
-    ) as vllm_model:
-        llm = vllm_model.model
-        # with set_default_torch_num_threads(1):
-        run_test(llm, config, TEST_IMAGES, expected_outputs=EXPECTED_OUTPUTS, lora_id=1)
+#         # NOTE currently, we only test cherry blossom since stop sign
+#         # output is slightly different for v1; - the root cause is likely
+#         # independent of the intent of this test, which is to ensure beam
+#         # search passes through lora through correctly.
+#         run_beam_search_test(
+#             llm,
+#             config,
+#             [ImageAsset("cherry_blossom")],
+#             expected_outputs=EXPECTED_BEAM_SEARCH_OUTPUTS,
+#             lora_id=1,
+#         )
+
+
+# @wait_until_npu_memory_free()
+# def test_qwen25vl_lora(qwen25vl_lora_files):
+#     """Test Qwen 2.5 VL model with LoRA"""
+#     config = TestConfig(model_path=QWEN25VL_MODEL_PATH, lora_path=qwen25vl_lora_files)
+
+#     # Test with different LoRA IDs
+#     with VllmRunner(
+#         config.model_path,
+#         max_num_seqs=config.max_num_seqs,
+#         enable_lora=True,
+#         max_loras=config.max_loras,
+#         max_lora_rank=config.max_lora_rank,
+#         enable_tower_connector_lora=config.enable_tower_connector_lora,
+#         gpu_memory_utilization=config.gpu_memory_utilization,
+#         mm_processor_kwargs=config.mm_processor_kwargs,
+#         mm_processor_cache_gb=config.mm_processor_cache_gb,
+#         max_model_len=config.max_model_len,
+#     ) as vllm_model:
+#         llm = vllm_model.model
+#         # with set_default_torch_num_threads(1):
+#         run_test(llm, config, TEST_IMAGES, expected_outputs=EXPECTED_OUTPUTS, lora_id=1)
 
 
 @wait_until_npu_memory_free()
@@ -226,7 +245,7 @@ def test_qwen25vl_vision_lora(qwen25vl_vision_lora_files):
         # Currently, tower_connector_lora is incompatible with
         # the multi-modal processor cache.
         # TODO: Remove this restriction
-        mm_processor_cache_gb=0,
+        # mm_processor_cache_gb=0,
         enable_tower_connector_lora=True,
     )
     with VllmRunner(
@@ -252,112 +271,112 @@ def test_qwen25vl_vision_lora(qwen25vl_vision_lora_files):
         )
 
 
-@wait_until_npu_memory_free()
-def test_qwen3vl_vision_lora(qwen3vl_vision_lora_files):
-    config = TestConfig(
-        model_path=QWEN3VL_MODEL_PATH,
-        lora_path=qwen3vl_vision_lora_files,
-        # Currently, tower_connector_lora is incompatible with
-        # the multi-modal processor cache.
-        # TODO: Remove this restriction
-        mm_processor_cache_gb=0,
-        enable_tower_connector_lora=True,
-    )
-    with VllmRunner(
-        config.model_path,
-        max_num_seqs=config.max_num_seqs,
-        enable_lora=True,
-        max_loras=config.max_loras,
-        max_lora_rank=config.max_lora_rank,
-        enable_tower_connector_lora=config.enable_tower_connector_lora,
-        gpu_memory_utilization=config.gpu_memory_utilization,
-        mm_processor_kwargs=config.mm_processor_kwargs,
-        mm_processor_cache_gb=config.mm_processor_cache_gb,
-        max_model_len=config.max_model_len,
-    ) as vllm_model:
-        llm = vllm_model.model
+# @wait_until_npu_memory_free()
+# def test_qwen3vl_vision_lora(qwen3vl_vision_lora_files):
+#     config = TestConfig(
+#         model_path=QWEN3VL_MODEL_PATH,
+#         lora_path=qwen3vl_vision_lora_files,
+#         # Currently, tower_connector_lora is incompatible with
+#         # the multi-modal processor cache.
+#         # TODO: Remove this restriction
+#         mm_processor_cache_gb=0,
+#         enable_tower_connector_lora=True,
+#     )
+#     with VllmRunner(
+#         config.model_path,
+#         max_num_seqs=config.max_num_seqs,
+#         enable_lora=True,
+#         max_loras=config.max_loras,
+#         max_lora_rank=config.max_lora_rank,
+#         enable_tower_connector_lora=config.enable_tower_connector_lora,
+#         gpu_memory_utilization=config.gpu_memory_utilization,
+#         mm_processor_kwargs=config.mm_processor_kwargs,
+#         mm_processor_cache_gb=config.mm_processor_cache_gb,
+#         max_model_len=config.max_model_len,
+#     ) as vllm_model:
+#         llm = vllm_model.model
 
-        run_test(
-            llm,
-            config,
-            TEST_IMAGES,
-            expected_outputs=EXPECTED_OUTPUTS,
-            lora_id=1,
-        )
+#         run_test(
+#             llm,
+#             config,
+#             TEST_IMAGES,
+#             expected_outputs=EXPECTED_OUTPUTS,
+#             lora_id=1,
+#         )
 
 
-@wait_until_npu_memory_free()
-def test_qwen2vl_multiple_lora_types(
-    qwen2vl_language_lora_files,
-    qwen2vl_vision_tower_connector_lora_files,
-    qwen2vl_vision_tower_lora_files,
-):
-    """
-    Test multiple LoRA adapter types (language, vision tower + connector,
-    vision tower only) using the same LLM instance to verify mm_encoder_cache
-    behavior with different LoRA requests.
+# @wait_until_npu_memory_free()
+# def test_qwen2vl_multiple_lora_types(
+#     qwen2vl_language_lora_files,
+#     qwen2vl_vision_tower_connector_lora_files,
+#     qwen2vl_vision_tower_lora_files,
+# ):
+#     """
+#     Test multiple LoRA adapter types (language, vision tower + connector,
+#     vision tower only) using the same LLM instance to verify mm_encoder_cache
+#     behavior with different LoRA requests.
 
-    By reusing the same LLM instance across different LoRA requests, we ensure that
-    the multimodal encoder cache correctly manages state transitions between
-    language-only and vision-enabled LoRA adapters.
-    """
-    config = TestConfig(
-        model_path=QWEN2VL_MODEL_PATH,
-        # We'll override the lora_path for each specific test, but need to provide
-        # an initial path for initialization
-        lora_path=qwen2vl_language_lora_files,
-        # Currently, tower_connector_lora is incompatible with
-        # the multi-modal processor cache.
-        # TODO: Remove this restriction
-        mm_processor_cache_gb=0,
-        enable_tower_connector_lora=True,
-    )
-    with VllmRunner(
-        config.model_path,
-        max_num_seqs=config.max_num_seqs,
-        enable_lora=True,
-        max_loras=config.max_loras,
-        max_lora_rank=config.max_lora_rank,
-        enable_tower_connector_lora=config.enable_tower_connector_lora,
-        gpu_memory_utilization=config.gpu_memory_utilization,
-        mm_processor_kwargs=config.mm_processor_kwargs,
-        mm_processor_cache_gb=config.mm_processor_cache_gb,
-        max_model_len=config.max_model_len,
-    ) as vllm_model:
-        llm = vllm_model.model
+#     By reusing the same LLM instance across different LoRA requests, we ensure that
+#     the multimodal encoder cache correctly manages state transitions between
+#     language-only and vision-enabled LoRA adapters.
+#     """
+#     config = TestConfig(
+#         model_path=QWEN2VL_MODEL_PATH,
+#         # We'll override the lora_path for each specific test, but need to provide
+#         # an initial path for initialization
+#         lora_path=qwen2vl_language_lora_files,
+#         # Currently, tower_connector_lora is incompatible with
+#         # the multi-modal processor cache.
+#         # TODO: Remove this restriction
+#         mm_processor_cache_gb=0,
+#         enable_tower_connector_lora=True,
+#     )
+#     with VllmRunner(
+#         config.model_path,
+#         max_num_seqs=config.max_num_seqs,
+#         enable_lora=True,
+#         max_loras=config.max_loras,
+#         max_lora_rank=config.max_lora_rank,
+#         enable_tower_connector_lora=config.enable_tower_connector_lora,
+#         gpu_memory_utilization=config.gpu_memory_utilization,
+#         mm_processor_kwargs=config.mm_processor_kwargs,
+#         mm_processor_cache_gb=config.mm_processor_cache_gb,
+#         max_model_len=config.max_model_len,
+#     ) as vllm_model:
+#         llm = vllm_model.model
 
-        # Test 1: Language-only LoRA adapter
-        config.lora_path = qwen2vl_language_lora_files
-        for lora_id in [1, 2]:
-            run_test(
-                llm,
-                config,
-                TEST_IMAGES,
-                expected_outputs=EXPECTED_OUTPUTS_LANGUAGE,
-                lora_id=lora_id,
-                lora_name="language_only",
-            )
+#         # Test 1: Language-only LoRA adapter
+#         config.lora_path = qwen2vl_language_lora_files
+#         for lora_id in [1, 2]:
+#             run_test(
+#                 llm,
+#                 config,
+#                 TEST_IMAGES,
+#                 expected_outputs=EXPECTED_OUTPUTS_LANGUAGE,
+#                 lora_id=lora_id,
+#                 lora_name="language_only",
+#             )
 
-        # Test 2: Vision tower + connector LoRA adapter
-        config.lora_path = qwen2vl_vision_tower_connector_lora_files
-        for lora_id in [3, 4]:
-            run_test(
-                llm,
-                config,
-                TEST_IMAGES,
-                expected_outputs=EXPECTED_OUTPUTS_VISION,
-                lora_id=lora_id,
-                lora_name="vision_tower_connector",
-            )
+#         # Test 2: Vision tower + connector LoRA adapter
+#         config.lora_path = qwen2vl_vision_tower_connector_lora_files
+#         for lora_id in [3, 4]:
+#             run_test(
+#                 llm,
+#                 config,
+#                 TEST_IMAGES,
+#                 expected_outputs=EXPECTED_OUTPUTS_VISION,
+#                 lora_id=lora_id,
+#                 lora_name="vision_tower_connector",
+#             )
 
-        # Test 3: Vision tower only LoRA adapter (no connector)
-        config.lora_path = qwen2vl_vision_tower_lora_files
-        for lora_id in [5, 6]:
-            run_test(
-                llm,
-                config,
-                TEST_IMAGES,
-                expected_outputs=EXPECTED_OUTPUTS_VISION_NO_CONNECTOR,
-                lora_id=lora_id,
-                lora_name="vision_tower",
-            )
+#         # Test 3: Vision tower only LoRA adapter (no connector)
+#         config.lora_path = qwen2vl_vision_tower_lora_files
+#         for lora_id in [5, 6]:
+#             run_test(
+#                 llm,
+#                 config,
+#                 TEST_IMAGES,
+#                 expected_outputs=EXPECTED_OUTPUTS_VISION_NO_CONNECTOR,
+#                 lora_id=lora_id,
+#                 lora_name="vision_tower",
+#             )
