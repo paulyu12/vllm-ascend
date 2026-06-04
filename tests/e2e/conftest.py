@@ -1657,6 +1657,11 @@ def qwen35_text_lora_files():
     return snapshot_download(repo_id="vllm-ascend/qwen35-4b-text-only-sql-lora")
 
 
+@pytest.fixture(scope="session")
+def qwen3moe_lora_files():
+    return "/data1/qwen3-moe-text3sql-spider"
+
+
 def qwen_prompt(questions: list[str]) -> list[str]:
     placeholder = "<|image_pad|>"
     return [
