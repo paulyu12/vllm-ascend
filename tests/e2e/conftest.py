@@ -1698,3 +1698,8 @@ def vl_config(request):
     if "skip" in config:
         pytest.skip(config["skip"])
     return config
+
+
+@pytest.fixture(scope="session")
+def qwen3moe_lora_files():
+    return "/data1/workspace-py/qwen3-moe-text2sql-spider"
