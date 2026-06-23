@@ -310,6 +310,105 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self.add_shrink(buffer, x, lora_a_stacked, scale, **kwargs)
         self.add_expand(y, buffer, lora_b_stacked, output_slices, add_inputs=True, **kwargs)
 
+    def add_lora_fused_moe(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        lora_a_stacked: tuple[torch.Tensor, ...],
+        lora_b_stacked: tuple[torch.Tensor, ...],
+        topk_weights: torch.Tensor | None,
+        sorted_token_ids: torch.Tensor | None,
+        expert_ids: torch.Tensor,
+        num_tokens_post_padded: torch.Tensor | None,
+        max_lora_rank: int,
+        top_k_num: int,
+        shrink_config,
+        expand_config,
+        adapter_enabled: torch.Tensor,
+        mul_routed_weight: bool = False,
+        fully_sharded: bool = False,
+        offset: int = 0,
+        token_lora_mapping: torch.Tensor | None = None,
+    ) -> None:
+        """
+        PyTorch/torch_npu-native implementation of fused MoE LoRA for NPU (v1).
+
+        Rows here are already one-token-per-row (the caller has
+        permuted/expanded tokens by (token, top_k) pair and passes
+        ``top_k_num=1``). A naive per-row gather of ``lora_a_stacked[lora,
+        expert]`` would materialize an ``[N_perm, rank, hidden]`` tensor per
+        row -- for chunked-prefill worst-case N_perm (tens of thousands of
+        rows) that is tens of GB and OOMs. Instead, for each active LoRA id
+        we sort its rows by expert id and reuse ``torch_npu.npu_grouped_matmul``
+        (the same primitive the base MLP path uses) so the per-expert A/B
+        weights are referenced once per group, not duplicated per row.
+
+        Semantics (row i, slice s):
+            l = token_lora_mapping[i]; e = expert_ids[i]
+            if l == -1 (no adapter) or not adapter_enabled[l]: skip
+            y[i, off:off+out_s] += (x[i] @ lora_a_stacked[s][l, e].T)
+                                     @ lora_b_stacked[s][l, e].T
+            off += out_s
+        """
+        del sorted_token_ids, num_tokens_post_padded, max_lora_rank
+        del shrink_config, expand_config, fully_sharded
+        assert top_k_num == 1, "Ascend MoE LoRA v1 expects pre-expanded rows (top_k_num=1)."
+        if token_lora_mapping is None:
+            token_lora_mapping = self.token_lora_indices
+
+        import torch_npu
+
+        x2d = x.view(-1, x.shape[-1])
+        y2d = y.view(-1, y.shape[-1])
+        expert_idx = expert_ids.to(torch.long)
+        num_experts = lora_a_stacked[0].shape[1]
+
+        for lora_id_t in torch.unique(token_lora_mapping):
+            lora_id = int(lora_id_t.item())
+            if lora_id < 0 or not bool(adapter_enabled[lora_id]):
+                continue
+            row_idx = (token_lora_mapping == lora_id).nonzero(as_tuple=True)[0]
+            if row_idx.numel() == 0:
+                continue
+
+            order = torch.argsort(expert_idx[row_idx])
+            row_idx = row_idx[order]
+            counts = torch.bincount(expert_idx[row_idx], minlength=num_experts).to(torch.int64)
+            # fp32 throughout: the rank-r intermediate must not round-trip
+            # through bf16 between shrink and expand, or the result drifts
+            # from a reference (e.g. Triton, which accumulates in fp32)
+            # implementation enough to flip a greedy-decoded token.
+            x_sorted = x2d[row_idx].to(torch.float32)
+
+            cur_offset = offset
+            for slice_idx in range(len(lora_a_stacked)):
+                a = lora_a_stacked[slice_idx][lora_id].transpose(1, 2).contiguous().to(torch.float32)  # [E, In, R]
+                b = lora_b_stacked[slice_idx][lora_id].transpose(1, 2).contiguous().to(torch.float32)  # [E, R, Out]
+                out_size = b.shape[-1]
+
+                shrink = torch_npu.npu_grouped_matmul(
+                    x=[x_sorted],
+                    weight=[a],
+                    split_item=2,
+                    group_list_type=1,
+                    group_type=0,
+                    group_list=counts,
+                )[0]  # [n_sub, R]
+                delta = torch_npu.npu_grouped_matmul(
+                    x=[shrink],
+                    weight=[b],
+                    split_item=2,
+                    group_list_type=1,
+                    group_type=0,
+                    group_list=counts,
+                )[0]  # [n_sub, out_size]
+
+                if mul_routed_weight and topk_weights is not None:
+                    delta = delta * topk_weights[row_idx].view(-1, 1)
+
+                y2d[row_idx, cur_offset : cur_offset + out_size] += delta.to(y2d.dtype)
+                cur_offset += out_size
+
     def add_lora_logits(
         self,
         y: torch.Tensor,

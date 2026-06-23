@@ -141,6 +141,8 @@ class MoEMlpComputeInput:
     need_trans: bool = False
     dynamic_eplb: bool = False
     swiglu_limit: int = 0
+    expanded_row_idx: torch.Tensor | None = None
+    topk_ids: torch.Tensor | None = None
 
 
 __all__ = [

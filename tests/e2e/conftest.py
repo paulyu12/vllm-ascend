@@ -1703,3 +1703,9 @@ def vl_config(request):
 @pytest.fixture(scope="session")
 def qwen3moe_lora_files():
     return "/data1/workspace-py/qwen3-moe-text2sql-spider"
+
+
+@pytest.fixture(scope="session")
+def olmoe_lora_files():
+    return "/data1/models/olmoe-instruct-text2sql-spider"
+    # return snapshot_download(repo_id="/data1/models/olmoe-instruct-text2sql-spider")

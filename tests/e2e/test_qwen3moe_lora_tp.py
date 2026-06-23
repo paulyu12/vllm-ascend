@@ -26,24 +26,23 @@ The People_ID of candidate is the foreign key of People_ID of people.
 <|im_start|>assistant"""  # noqa: E501
 
 EXPECTED_LORA_OUTPUT = [
-    "<think>\nOkay, the user is asking how many candidates there are. Let me think about the database structure.\n\nThe candidate_poll database has two tables: candidate and people. The candidate table has Candidate_ID as the primary key, and People_ID as a foreign key referencing the people table. The people table has People_ID"
-    # "<think>\n\n</think>\n\nSELECT count(*) FROM candidate",
-    # "<think>\n\n</think>\n\nSELECT count(*) FROM candidate",
-    # "<think>\n\n</think>\n\nSELECT poll_source FROM candidate GROUP BY poll_source ORDER BY count(*) DESC LIMIT 1",  # noqa: E501
-    # "<think>\n\n</think>\n\nSELECT poll_source FROM candidate GROUP BY poll_source ORDER BY count(*) DESC LIMIT 1",  # noqa: E501
+    "<think>\n\n</think>\n\nSELECT count(*) FROM candidate",
+    "<think>\n\n</think>\n\nSELECT count(*) FROM candidate",
+    "<think>\n\n</think>\n\nSELECT poll_source FROM candidate GROUP BY poll_source ORDER BY count(*) DESC LIMIT 1",  # noqa: E501
+    "<think>\n\n</think>\n\nSELECT poll_source FROM candidate GROUP BY poll_source ORDER BY count(*) DESC LIMIT 1",  # noqa: E501
 ]
 
 
 def generate_and_test(llm: vllm.LLM, lora_path: str, lora_id: int) -> None:
     prompts = [
         PROMPT_TEMPLATE.format(context="How many candidates are there?"),
-        # PROMPT_TEMPLATE.format(context="Count the number of candidates."),
-        # PROMPT_TEMPLATE.format(
-        #     context="Which poll resource provided the most number of candidate information?"  # noqa: E501
-        # ),
-        # PROMPT_TEMPLATE.format(
-        #     context="Return the poll resource associated with the most candidates."
-        # ),
+        PROMPT_TEMPLATE.format(context="Count the number of candidates."),
+        PROMPT_TEMPLATE.format(
+            context="Which poll resource provided the most number of candidate information?"  # noqa: E501
+        ),
+        PROMPT_TEMPLATE.format(
+            context="Return the poll resource associated with the most candidates."
+        ),
     ]
     sampling_params = vllm.SamplingParams(temperature=0, max_tokens=64)
     outputs = llm.generate(
