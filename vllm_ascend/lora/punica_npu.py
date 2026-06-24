@@ -331,24 +331,27 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         token_lora_mapping: torch.Tensor | None = None,
     ) -> None:
         """
-        PyTorch/torch_npu-native implementation of fused MoE LoRA for NPU (v1).
+        Ascend-native fused MoE LoRA (v2): static-shape per-row gather via the
+        same bgmv_shrink/bgmv_expand AscendC kernels (csrc/kernels/bgmv_*.cpp)
+        used by the dense Linear LoRA layers, instead of grouping rows by a
+        data-dependent ``torch.unique`` over active LoRA ids. The previous
+        ``torch.unique``/``nonzero`` version produced output whose *shape*
+        depended on tensor values, which ACL Graph capture cannot record
+        (it failed with an `aclnnUnique2` error as soon as `enforce_eager`
+        was turned off) -- every tensor below has a shape that depends only
+        on input shapes, never on values, so this stays graph-capturable.
 
-        Rows here are already one-token-per-row (the caller has
-        permuted/expanded tokens by (token, top_k) pair and passes
-        ``top_k_num=1``). A naive per-row gather of ``lora_a_stacked[lora,
-        expert]`` would materialize an ``[N_perm, rank, hidden]`` tensor per
-        row -- for chunked-prefill worst-case N_perm (tens of thousands of
-        rows) that is tens of GB and OOMs. Instead, for each active LoRA id
-        we sort its rows by expert id and reuse ``torch_npu.npu_grouped_matmul``
-        (the same primitive the base MLP path uses) so the per-expert A/B
-        weights are referenced once per group, not duplicated per row.
-
-        Semantics (row i, slice s):
-            l = token_lora_mapping[i]; e = expert_ids[i]
-            if l == -1 (no adapter) or not adapter_enabled[l]: skip
-            y[i, off:off+out_s] += (x[i] @ lora_a_stacked[s][l, e].T)
-                                     @ lora_b_stacked[s][l, e].T
-            off += out_s
+        Rows are already one-token-per-row (top_k_num=1). Each row needs the
+        LoRA slot for (lora_id, expert_id), so we fold both into a single
+        gather index into a ``[max_loras * num_experts, ...]`` view of the
+        existing per-(lora, expert) weight stacks:
+            combined_idx[row] = lora_id[row] * num_experts + expert_id[row]
+        or -1 when the row has no active adapter, mirroring the -1 sentinel
+        ``PunicaWrapperBase.token_lora_indices`` already uses. bgmv_shrink/
+        bgmv_expand skip any row whose index is negative (leaving the
+        zero-initialized shrink buffer / unmodified ``y`` in place), so
+        inactive rows get a zero delta for free -- no Python-level branching
+        needed.
         """
         del sorted_token_ids, num_tokens_post_padded, max_lora_rank
         del shrink_config, expand_config, fully_sharded
@@ -356,58 +359,43 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         if token_lora_mapping is None:
             token_lora_mapping = self.token_lora_indices
 
-        import torch_npu
-
         x2d = x.view(-1, x.shape[-1])
         y2d = y.view(-1, y.shape[-1])
-        expert_idx = expert_ids.to(torch.long)
+        expert_idx = expert_ids.view(-1).to(torch.long)
         num_experts = lora_a_stacked[0].shape[1]
 
-        for lora_id_t in torch.unique(token_lora_mapping):
-            lora_id = int(lora_id_t.item())
-            if lora_id < 0 or not bool(adapter_enabled[lora_id]):
-                continue
-            row_idx = (token_lora_mapping == lora_id).nonzero(as_tuple=True)[0]
-            if row_idx.numel() == 0:
-                continue
+        lora_idx_safe = token_lora_mapping.clamp(min=0)
+        enabled = (token_lora_mapping >= 0) & adapter_enabled[lora_idx_safe].bool()
+        combined_idx = torch.where(
+            enabled,
+            lora_idx_safe * num_experts + expert_idx,
+            torch.full_like(token_lora_mapping, -1),
+        ).contiguous()
 
-            order = torch.argsort(expert_idx[row_idx])
-            row_idx = row_idx[order]
-            counts = torch.bincount(expert_idx[row_idx], minlength=num_experts).to(torch.int64)
-            # fp32 throughout: the rank-r intermediate must not round-trip
-            # through bf16 between shrink and expand, or the result drifts
-            # from a reference (e.g. Triton, which accumulates in fp32)
-            # implementation enough to flip a greedy-decoded token.
-            x_sorted = x2d[row_idx].to(torch.float32)
+        cur_offset = offset
+        for slice_idx in range(len(lora_a_stacked)):
+            # lora_a_stacked[s]/lora_b_stacked[s]: [max_loras, num_experts, rank, *].
+            # Flattening the leading two dims turns "gather by (lora, expert)"
+            # into the plain per-row gather bgmv_shrink/bgmv_expand already do
+            # for dense Linear LoRA (gather by lora id alone).
+            a = lora_a_stacked[slice_idx]
+            b = lora_b_stacked[slice_idx]
+            rank = a.shape[-2]
+            out_size = b.shape[-2]
+            a_flat = a.view(-1, rank, a.shape[-1])
+            b_flat = b.view(-1, out_size, rank)
 
-            cur_offset = offset
-            for slice_idx in range(len(lora_a_stacked)):
-                a = lora_a_stacked[slice_idx][lora_id].transpose(1, 2).contiguous().to(torch.float32)  # [E, In, R]
-                b = lora_b_stacked[slice_idx][lora_id].transpose(1, 2).contiguous().to(torch.float32)  # [E, R, Out]
-                out_size = b.shape[-1]
+            # bgmv_shrink writes fp32 (its Y_T); bgmv_expand reads fp32 (its
+            # X_T) -- the dtype contract between the two ops, not a choice
+            # made here for precision.
+            shrink_out = torch.zeros((x2d.shape[0], rank), dtype=torch.float32, device=x2d.device)
+            self.bgmv_shrink(x2d, a_flat, shrink_out, combined_idx, 1.0)
 
-                shrink = torch_npu.npu_grouped_matmul(
-                    x=[x_sorted],
-                    weight=[a],
-                    split_item=2,
-                    group_list_type=1,
-                    group_type=0,
-                    group_list=counts,
-                )[0]  # [n_sub, R]
-                delta = torch_npu.npu_grouped_matmul(
-                    x=[shrink],
-                    weight=[b],
-                    split_item=2,
-                    group_list_type=1,
-                    group_type=0,
-                    group_list=counts,
-                )[0]  # [n_sub, out_size]
+            if mul_routed_weight and topk_weights is not None:
+                shrink_out = shrink_out * topk_weights.view(-1, 1)
 
-                if mul_routed_weight and topk_weights is not None:
-                    delta = delta * topk_weights[row_idx].view(-1, 1)
-
-                y2d[row_idx, cur_offset : cur_offset + out_size] += delta.to(y2d.dtype)
-                cur_offset += out_size
+            self.bgmv_expand_slice(shrink_out, b_flat, y2d, combined_idx, cur_offset, out_size, add_inputs=True)
+            cur_offset += out_size
 
     def add_lora_logits(
         self,
