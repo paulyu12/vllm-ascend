@@ -316,15 +316,22 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         x: torch.Tensor,
         lora_a_stacked: tuple[torch.Tensor, ...],
         lora_b_stacked: tuple[torch.Tensor, ...],
-        topk_weights: torch.Tensor | None,
-        sorted_token_ids: torch.Tensor | None,
-        expert_ids: torch.Tensor,
-        num_tokens_post_padded: torch.Tensor | None,
-        max_lora_rank: int,
-        top_k_num: int,
-        shrink_config,
-        expand_config,
-        adapter_enabled: torch.Tensor,
+        # NOTE: parameter order matches the base-class override contract
+        # (PunicaWrapperBase.add_lora_fused_moe). Several of them are
+        # Triton-specific and unused by this AscendC bgmv implementation
+        # (sorted_token_ids, num_tokens_post_padded, max_lora_rank,
+        # shrink_config, expand_config, fully_sharded -- ``del``'d below);
+        # they are kept in the signature for interface compatibility but
+        # defaulted so the Ascend call sites need not pass them.
+        topk_weights: torch.Tensor | None = None,
+        sorted_token_ids: torch.Tensor | None = None,
+        expert_ids: torch.Tensor | None = None,
+        num_tokens_post_padded: torch.Tensor | None = None,
+        max_lora_rank: int = 0,
+        top_k_num: int = 1,
+        shrink_config=None,
+        expand_config=None,
+        adapter_enabled: torch.Tensor | None = None,
         mul_routed_weight: bool = False,
         fully_sharded: bool = False,
         offset: int = 0,
