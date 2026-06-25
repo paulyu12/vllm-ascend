@@ -146,6 +146,7 @@ def build_fused_experts_input(
     w1_offset: torch.Tensor | None = None,
     w2_offset: torch.Tensor | None = None,
     swiglu_limit: int = 0,
+    lora_context=None,
 ) -> MoEFusedExpertsInput:
     return MoEFusedExpertsInput(
         hidden_states=hidden_states,
@@ -188,6 +189,7 @@ def build_fused_experts_input(
             is_per_channel_weight=is_per_channel_weight,
         ),
         swiglu_limit=swiglu_limit,
+        lora_context=lora_context,
     )
 
 
@@ -233,6 +235,7 @@ def build_mlp_compute_input(
         swiglu_limit=fused_experts_input.swiglu_limit,
         expanded_row_idx=expanded_row_idx,
         topk_ids=fused_experts_input.topk_ids,
+        lora_context=fused_experts_input.lora_context,
     )
 
 

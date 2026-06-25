@@ -48,16 +48,12 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from vllm.logger import logger
 from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.lora.layers.fused_moe import FusedMoE3DWithLoRA, FusedMoEWithLoRA
 from vllm.lora.layers.utils import _get_lora_device
 
 import vllm_ascend.envs as envs_ascend
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.ops.activation import AscendSwigluOAIAndMul
 from vllm_ascend.ops.fused_moe.fused_moe import AscendFusedMoE
-from vllm_ascend.ops.fused_moe.moe_stage_contracts import MoEMlpComputeInput
 
 
 def _assert_ascend_moe_lora_supported(base_layer: AscendFusedMoE) -> None:
@@ -89,17 +85,106 @@ def _assert_ascend_moe_lora_supported(base_layer: AscendFusedMoE) -> None:
     if getattr(base_layer, "multistream_overlap_gate", False):
         raise AssertionError(
             "multistream_overlap_gate=True interleaves quant_method.apply "
-            "calls on multiple streams, which breaks the bracketed "
-            "comm._apply_mlp swap. Disable it for MoE LoRA."
+            "calls on multiple streams; the MoE LoRA path has not been "
+            "validated under this overlap. Disable it for MoE LoRA."
         )
+
+
+def _recover_moe_lora_routing(lora_context, expanded_row_idx, topk_ids):
+    """Recover per-permuted-row (expert_id, lora_slot) for the dispatched rows.
+
+    npu_moe_init_routing semantics (verified empirically): ``expanded_row_idx``
+    is indexed by the ORIGINAL flat (token, k) position and gives where that
+    pair landed in the expert-sorted array -- not the reverse. So recovering
+    "which (token, k) pair does sorted row i hold" needs the inverse permutation
+    of ``expanded``, not a direct gather by it. ``argsort`` output shape ==
+    input shape (value-independent), so this stays graph-capturable -- no
+    ``.item()``/data-dependent host sync.
+    """
+    top_k = lora_context.top_k
+    expanded = torch.abs(expanded_row_idx)
+    inv_perm = torch.argsort(expanded)
+    expert_per_row = topk_ids.reshape(-1)[inv_perm].to(torch.long)
+
+    # token_lora_indices is a 1D LongTensor sized to max_num_batched_tokens
+    # (host-known constant). Clamping defensively to the last index is a no-op
+    # in normal operation but keeps the gather graph-safe.
+    orig_token = inv_perm // top_k
+    token_lora_indices = lora_context.punica_wrapper.token_lora_indices
+    orig_token = orig_token.clamp_(max=token_lora_indices.numel() - 1)
+    lora_per_row = token_lora_indices[orig_token]
+    return expert_per_row, lora_per_row
+
+
+def moe_lora_apply_w13(lora_context, *, gate_up_out, hidden_states, expanded_row_idx, topk_ids):
+    """Add the w13 LoRA delta into ``gate_up_out`` (in place), before activation.
+
+    Called from ``unquant_apply_mlp`` right after the base gate_up GMM. Returns
+    the recovered per-row routing so the w2 delta can reuse it.
+    """
+    routing = _recover_moe_lora_routing(lora_context, expanded_row_idx, topk_ids)
+    expert_per_row, lora_per_row = routing
+    lora_context.punica_wrapper.add_lora_fused_moe(
+        y=gate_up_out,
+        x=hidden_states,
+        lora_a_stacked=lora_context.w13_lora_a_stacked,
+        lora_b_stacked=lora_context.w13_lora_b_stacked,
+        topk_weights=None,
+        sorted_token_ids=None,
+        expert_ids=expert_per_row,
+        num_tokens_post_padded=None,
+        max_lora_rank=lora_context.w13_lora_a_stacked[0].shape[-2],
+        top_k_num=1,
+        shrink_config={},
+        expand_config={},
+        adapter_enabled=lora_context.adapter_enabled,
+        mul_routed_weight=False,
+        fully_sharded=lora_context.fully_sharded,
+        offset=0,
+        token_lora_mapping=lora_per_row,
+    )
+    return routing
+
+
+def moe_lora_apply_w2(lora_context, *, down_out, silu_out, lora_routing):
+    """Add the w2 LoRA delta into ``down_out`` (in place), after the down GMM.
+
+    Reuses the per-row routing computed by ``moe_lora_apply_w13``; ``silu_out``
+    is the activation output that fed the base down GMM.
+    """
+    expert_per_row, lora_per_row = lora_routing
+    lora_context.punica_wrapper.add_lora_fused_moe(
+        y=down_out,
+        x=silu_out,
+        lora_a_stacked=lora_context.w2_lora_a_stacked,
+        lora_b_stacked=lora_context.w2_lora_b_stacked,
+        topk_weights=None,
+        sorted_token_ids=None,
+        expert_ids=expert_per_row,
+        num_tokens_post_padded=None,
+        max_lora_rank=lora_context.w2_lora_a_stacked[0].shape[-2],
+        top_k_num=1,
+        shrink_config={},
+        expand_config={},
+        adapter_enabled=lora_context.adapter_enabled,
+        mul_routed_weight=False,
+        fully_sharded=lora_context.fully_sharded,
+        offset=0,
+        token_lora_mapping=lora_per_row,
+    )
 
 
 class AscendFusedMoEWithLoRA(FusedMoEWithLoRA):
     """Ascend-native MoE-LoRA wrapper.
 
     Reuses upstream weight allocation, set_lora, reset_lora, and slicing.
-    Overrides only the injection mechanism (`_inject_lora_into_fused_moe`
-    is bypassed; we wrap `quant_method.apply` instead).
+    Instead of the GPU modular-kernel injection, it publishes a per-layer
+    ``MoELoRAContext`` onto the base layer (``_ascend_moe_lora_context``).
+    The Ascend unquant MoE path threads that context through
+    ``MoEFusedExpertsInput`` -> ``MoEMlpComputeInput`` and applies the LoRA
+    delta natively inside ``unquant_apply_mlp`` (see
+    ``moe_lora_apply_w13`` / ``moe_lora_apply_w2`` below) -- no runtime
+    monkey-patch of ``comm._apply_mlp``.
     """
 
     def __init__(self, base_layer: AscendFusedMoE) -> None:
@@ -112,58 +197,6 @@ class AscendFusedMoEWithLoRA(FusedMoEWithLoRA):
         self.tp_rank = get_tensor_model_parallel_rank()
         self.device = _get_lora_device(base_layer)
         self._w13_slices = 2 if base_layer.moe_config.is_act_and_mul else 1
-        # Per-layer scratch for state captured at apply-time and consumed
-        # inside _apply_mlp_with_lora.
-        self._moe_state: dict = {}
-        self._inject_lora_into_ascend_fused_moe()
-
-    # ------------------------------------------------------------------
-    # Injection
-    # ------------------------------------------------------------------
-    def _inject_lora_into_ascend_fused_moe(self) -> None:
-        """Patch this layer's quant_method.apply to bracket-swap _apply_mlp.
-
-        Bound-method idiom: we replace `quant_method.apply` with a bound
-        method that captures `self` (the LoRA wrapper) so each of the 48
-        MoE layers has its own wrapper carrying its own stacked LoRA
-        weights. The wrapped function does:
-
-            comm = _EXTRA_CTX.moe_comm_method  # picked per-forward
-            orig_mlp = comm._apply_mlp
-            try:
-                comm._apply_mlp = our LoRA-aware version
-                return orig_apply(...)         # base path runs as usual,
-                                               # _apply_mlp call goes through us
-            finally:
-                comm._apply_mlp = orig_mlp     # always restore
-
-        This guarantees the swap is strictly bracketed within a single
-        layer's forward pass.
-        """
-        quant_method = self.base_layer.quant_method
-        orig_apply = quant_method.apply
-        self_ref = self
-
-        def apply_wrapper(qm_self, layer, x, *args, **kwargs):
-            comm = _EXTRA_CTX.moe_comm_method
-            if comm is None:
-                # Without a comm method we cannot reach _apply_mlp; let the
-                # base apply run and skip LoRA. This shouldn't happen in
-                # practice because ascend_forward_context sets it per fwd.
-                return orig_apply(layer, x, *args, **kwargs)
-            orig_mlp = comm._apply_mlp
-            self_ref._moe_state["expert_map"] = kwargs.get("expert_map")
-            try:
-                comm._apply_mlp = lambda mlp_input: self_ref._apply_mlp_with_lora(orig_mlp, mlp_input)
-                return orig_apply(layer, x, *args, **kwargs)
-            finally:
-                comm._apply_mlp = orig_mlp
-
-        # Bind as instance attribute on quant_method so each layer has its own.
-        # We cannot use __get__ because orig_apply already is a bound method;
-        # storing the function directly works because Python looks up instance
-        # attrs before class attrs.
-        quant_method.apply = apply_wrapper.__get__(quant_method, type(quant_method))  # type: ignore[method-assign]
 
     # ------------------------------------------------------------------
     # Mapping
@@ -172,166 +205,15 @@ class AscendFusedMoEWithLoRA(FusedMoEWithLoRA):
         # Upstream FusedMoEWithLoRA.set_mapping (vllm v0.22.0+) chains into
         # ``self._moe_kernel.fused_experts.set_lora_context(...)``, but
         # ``_moe_kernel`` is only set by the GPU modular-kernel path that we
-        # deliberately skip in __init__. Our injection works through
-        # ``punica_wrapper.add_lora_fused_moe(...)`` inside
-        # ``_apply_mlp_with_lora``; we only need the base layer to remember
-        # the punica wrapper.
+        # deliberately skip in __init__. We instead build the per-layer
+        # MoELoRAContext (now that punica_wrapper is available) and publish it
+        # on the base layer; AscendUnquantizedFusedMoEMethod.apply reads it via
+        # ``getattr(layer, "_ascend_moe_lora_context", None)`` and threads it
+        # down to unquant_apply_mlp. The context holds stable references (the
+        # in-place-updated LoRA stacks, adapter_enabled and the punica wrapper),
+        # so building it once here is sufficient.
         BaseLayerWithLoRA.set_mapping(self, punica_wrapper)
-
-    # ------------------------------------------------------------------
-    # LoRA-aware MLP
-    # ------------------------------------------------------------------
-    def _apply_mlp_with_lora(self, orig_mlp, mlp_input: MoEMlpComputeInput):
-        """LoRA-aware replacement for MoECommMethod._apply_mlp.
-
-        v1 supports only the unquant + AllGather (expanded_row_idx present)
-        path. Any other path falls back to the base implementation so the
-        forward still produces (non-LoRA-augmented) output.
-        """
-        if mlp_input.quant.is_quant:
-            logger.warning_once(
-                "Ascend MoE LoRA on quantized path is not implemented; "
-                "running base path only (LoRA delta will be skipped)."
-            )
-            return orig_mlp(mlp_input)
-        if mlp_input.expanded_row_idx is None:
-            logger.warning_once(
-                "Ascend MoE LoRA requires AllGather comm method "
-                "(combine_metadata.expanded_row_idx); current comm method "
-                "does not provide it. Skipping LoRA delta."
-            )
-            return orig_mlp(mlp_input)
-        if mlp_input.topk_ids is None:
-            logger.warning_once("Ascend MoE LoRA: topk_ids unavailable in MoEMlpComputeInput; skipping LoRA delta.")
-            return orig_mlp(mlp_input)
-
-        # Local imports keep the GPU-only test environment importable.
-        import torch_npu
-
-        h = mlp_input.hidden_states  # [N_perm, hidden_in]
-        gl = mlp_input.group_list
-        glt = mlp_input.group_list_type
-        w1 = mlp_input.weights.w1
-        w2 = mlp_input.weights.w2
-        w1_bias = mlp_input.weights.w1_bias
-        w2_bias = mlp_input.weights.w2_bias
-        # Unquantized MoE always stores w1/w2 as Tensor (the list[Tensor] form
-        # is only used by per-channel quantized paths, which we early-out above
-        # via mlp_input.quant.is_quant).
-        assert isinstance(w1, torch.Tensor) and isinstance(w2, torch.Tensor)
-        need_trans = mlp_input.need_trans
-        if need_trans:
-            # process_weights_after_loading stores w1/w2 already transposed
-            # to [num_experts, in, out]; only the legacy unquant path with
-            # need_trans=True flips back.
-            w1 = w1.transpose(1, 2)
-            w2 = w2.transpose(1, 2)
-
-        # ---- per-permuted-row (expert_id, orig_token) (1D, length N_perm) ----
-        # npu_moe_init_routing semantics (verified empirically, NOT the inverse
-        # we originally assumed): `expanded_row_idx[orig_flat_idx] = sorted_row`,
-        # i.e. it is indexed by the ORIGINAL flat (token, k) position and gives
-        # where that pair landed in the expert-sorted array - not the reverse.
-        # So recovering "which (token, k) pair does sorted row i hold" requires
-        # the inverse permutation of `expanded`, not a direct gather by it.
-        # `argsort` has output shape == input shape (independent of tensor
-        # contents), so this stays graph-capturable - no `.item()`/data-dependent
-        # sync like the `torch.repeat_interleave(arange, gl)` alternative would
-        # need (that requires reading `gl.sum()` on the host).
-        top_k = self.base_layer.top_k
-        expanded = torch.abs(mlp_input.expanded_row_idx)
-        inv_perm = torch.argsort(expanded)
-        expert_per_row = mlp_input.topk_ids.reshape(-1)[inv_perm].to(torch.long)
-
-        # ---- per-permuted-row lora slot (1D, length N_perm) ----
-        # token_lora_indices is a 1D LongTensor on device, sized to
-        # max_num_batched_tokens (host-known constant). Clamping defensively
-        # to the last index is a no-op in normal operation but graph-safe.
-        orig_token = inv_perm // top_k
-        token_lora_indices = self.punica_wrapper.token_lora_indices
-        orig_token = orig_token.clamp_(max=token_lora_indices.numel() - 1)
-        lora_per_row = token_lora_indices[orig_token]
-
-        # === Stage 1: gate_up GMM (base) ===
-        gate_up = torch_npu.npu_grouped_matmul(
-            x=[h],
-            weight=[w1],
-            bias=[w1_bias.to(dtype=torch.float32)] if w1_bias is not None else None,
-            split_item=2,
-            group_list_type=glt,
-            group_type=0,
-            group_list=gl,
-        )[0]  # [N_perm, 2*inter] (or [N_perm, inter] when _w13_slices==1)
-
-        # === Stage 2: LoRA delta for w13 ===
-        self.punica_wrapper.add_lora_fused_moe(
-            y=gate_up,
-            x=h,
-            lora_a_stacked=self.w13_lora_a_stacked,
-            lora_b_stacked=self.w13_lora_b_stacked,
-            topk_weights=None,
-            sorted_token_ids=None,
-            expert_ids=expert_per_row,
-            num_tokens_post_padded=None,
-            max_lora_rank=self.w13_lora_a_stacked[0].shape[-2],
-            top_k_num=1,
-            shrink_config={},
-            expand_config={},
-            adapter_enabled=self.adapter_enabled,
-            mul_routed_weight=False,
-            fully_sharded=self.fully_sharded,
-            offset=0,
-            token_lora_mapping=lora_per_row,
-        )
-
-        # === Stage 3: activation (SiLU / SwiGLU) ===
-        # Match unquant_apply_mlp: activation may arrive as an enum (vllm
-        # MoEActivation) or as a raw string; ``getattr(..., "value", ...)``
-        # normalizes both.
-        act_name = getattr(mlp_input.activation, "value", mlp_input.activation)
-        if act_name == "swigluoai":
-            silu_out = AscendSwigluOAIAndMul.swiglu_oai_forward(gate_up.view(-1, gate_up.shape[-1]))
-        else:
-            silu_out = torch_npu.npu_swiglu(gate_up)
-        if mlp_input.topk_scales is not None:
-            silu_out = silu_out * mlp_input.topk_scales
-
-        # === Stage 4: down GMM (base) ===
-        out = torch_npu.npu_grouped_matmul(
-            x=[silu_out],
-            weight=[w2],
-            bias=[w2_bias.to(dtype=torch.float32)] if w2_bias is not None else None,
-            split_item=2,
-            group_list_type=glt,
-            group_type=0,
-            group_list=gl,
-        )[0]  # [N_perm, hidden_out]
-
-        # === Stage 5: LoRA delta for w2 ===
-        self.punica_wrapper.add_lora_fused_moe(
-            y=out,
-            x=silu_out,
-            lora_a_stacked=self.w2_lora_a_stacked,
-            lora_b_stacked=self.w2_lora_b_stacked,
-            topk_weights=None,
-            sorted_token_ids=None,
-            expert_ids=expert_per_row,
-            num_tokens_post_padded=None,
-            max_lora_rank=self.w2_lora_a_stacked[0].shape[-2],
-            top_k_num=1,
-            shrink_config={},
-            expand_config={},
-            adapter_enabled=self.adapter_enabled,
-            mul_routed_weight=False,
-            fully_sharded=self.fully_sharded,
-            offset=0,
-            token_lora_mapping=lora_per_row,
-        )
-        # Match MoECommMethod._apply_mlp return contract: (hidden, before_gmm2_evt).
-        # Unquant path produces no overlap event (mirrors unquant_apply_mlp's
-        # ``return hidden_states, None``); fallback branches above already
-        # forward the base ``orig_mlp`` tuple verbatim.
-        return out, None
+        self.base_layer._ascend_moe_lora_context = self._build_lora_context()
 
     # ------------------------------------------------------------------
     # Layer-replacement registration
