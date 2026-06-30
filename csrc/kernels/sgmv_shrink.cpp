@@ -200,7 +200,13 @@ private:
     __aicore__ inline void CopyOut(const int64_t idx)
     {
         AscendC::LocalTensor<Y_T> yOutLocal = outQueueY_.DeQue<Y_T>();
-        DataCopy(yOutGm_[maxLoRARank_ * idx], yOutLocal, maxLoRARank_);
+        // maxLoRARank_ is the per-TP-shard LoRA rank, which is not guaranteed
+        // to be 32-byte aligned (e.g. rank 4 when a rank-8 adapter is split
+        // across TP=2 with fully_sharded_loras). A plain DataCopy of a
+        // sub-block length silently drops the store, zeroing the shrink output.
+        // DataCopyPad copies the exact byte length regardless of alignment.
+        uint16_t blockLen = static_cast<uint16_t>(maxLoRARank_ * sizeof(Y_T));
+        DataCopyPad(yOutGm_[maxLoRARank_ * idx], yOutLocal, {1, blockLen, 0, 0});
         outQueueY_.FreeTensor(yOutLocal);
     }
 
