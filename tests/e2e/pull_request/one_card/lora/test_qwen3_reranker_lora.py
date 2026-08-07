@@ -1,44 +1,11 @@
 from pathlib import Path
 
-from vllm import LLM
+from tests.e2e.conftest import VllmRunner, wait_until_npu_memory_free
 
 model_name = "Qwen/Qwen3-Reranker-0.6B"
 
 
-def get_llm() -> LLM:
-    """
-    Initializes and returns the LLM model for Qwen3-Reranker.
-
-    Returns:
-        LLM: Configured vLLM instance for reranking tasks.
-
-    Note:
-        This function loads the ORIGINAL Qwen3-Reranker model with specific
-        overrides to make it compatible with vLLM's score API.
-    """
-    return LLM(
-        # Specify the original model from HuggingFace
-        model=model_name,
-        # Use pooling runner for score task
-        runner="pooling",
-        # HuggingFace model configuration overrides required for compatibility
-        hf_overrides={
-            # Manually route to sequence classification architecture
-            # This tells vLLM to use Qwen3ForSequenceClassification instead of
-            # the default Qwen3ForCausalLM
-            "architectures": ["Qwen3ForSequenceClassification"],
-            # Specify which token logits to extract from the language model head
-            # The original reranker uses "no" and "yes" token logits for scoring
-            "classifier_from_token": ["no", "yes"],
-            # Enable special handling for original Qwen3-Reranker models
-            # This flag triggers conversion logic that transforms the two token
-            # vectors into a single classification vector
-            "is_original_qwen3_reranker": True,
-        },
-        enable_lora=True,
-    )
-
-
+@wait_until_npu_memory_free()
 def test_reranker_models_lora():
     # Load the Jinja template for formatting query-document pairs
     # The template ensures proper formatting for the reranker model
@@ -60,12 +27,32 @@ def test_reranker_models_lora():
     ]
 
     # Initialize the LLM model with the original Qwen3-Reranker configuration
-    llm = get_llm()
+    with VllmRunner(
+        model_name,
+        # Use pooling runner for score task
+        runner="pooling",
+        # HuggingFace model configuration overrides required for compatibility
+        hf_overrides={
+            # Manually route to sequence classification architecture
+            # This tells vLLM to use Qwen3ForSequenceClassification instead of
+            # the default Qwen3ForCausalLM
+            "architectures": ["Qwen3ForSequenceClassification"],
+            # Specify which token logits to extract from the language model head
+            # The original reranker uses "no" and "yes" token logits for scoring
+            "classifier_from_token": ["no", "yes"],
+            # Enable special handling for original Qwen3-Reranker models
+            # This flag triggers conversion logic that transforms the two token
+            # vectors into a single classification vector
+            "is_original_qwen3_reranker": True,
+        },
+        enable_lora=True,
+    ) as vllm_model:
+        llm = vllm_model.model
 
-    # Compute relevance scores for each query-document pair
-    # The score() method returns a relevance score for each pair
-    # Higher scores indicate better relevance
-    outputs = llm.score(queries, documents, chat_template=chat_template)
+        # Compute relevance scores for each query-document pair
+        # The score() method returns a relevance score for each pair
+        # Higher scores indicate better relevance
+        outputs = llm.score(queries, documents, chat_template=chat_template)
 
     # Extract and print the relevance scores from the outputs
     # Each output contains a score representing query-document relevance

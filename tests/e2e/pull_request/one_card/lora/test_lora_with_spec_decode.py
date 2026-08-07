@@ -8,8 +8,10 @@ import random
 import numpy as np
 import pytest
 import torch
-from vllm import LLM, SamplingParams
+from vllm import SamplingParams
 from vllm.lora.request import LoRARequest
+
+from tests.e2e.conftest import VllmRunner, wait_until_npu_memory_free
 
 LORA_TEST_PROMPT_MAP: dict[str, str] = {}
 
@@ -45,6 +47,7 @@ SEED = 42
         )
     ],
 )
+@wait_until_npu_memory_free()
 def test_batch_inference_correctness(
     model_setup: tuple[str, str, str, str, int],
 ):
@@ -65,9 +68,8 @@ def test_batch_inference_correctness(
     sampling_params = SamplingParams(temperature=0.0, top_p=1.0, top_k=-1, seed=SEED, max_tokens=128)
 
     # without speculative decoding
-    ref_llm = LLM(
-        model=model_name,
-        trust_remote_code=True,
+    with VllmRunner(
+        model_name,
         tensor_parallel_size=tp_size,
         max_model_len=2048,
         max_num_seqs=4,
@@ -75,14 +77,13 @@ def test_batch_inference_correctness(
         max_loras=1,
         max_cpu_loras=1,
         max_lora_rank=16,
-    )
-    ref_outputs = ref_llm.generate(prompts, sampling_params, lora_request=lora_request)
-    del ref_llm
+    ) as vllm_model:
+        ref_llm = vllm_model.model
+        ref_outputs = ref_llm.generate(prompts, sampling_params, lora_request=lora_request)
 
     # speculative decoding
-    lora_spec_llm = LLM(
-        model=model_name,
-        trust_remote_code=True,
+    with VllmRunner(
+        model_name,
         tensor_parallel_size=tp_size,
         speculative_config={
             "method": method,
@@ -96,9 +97,9 @@ def test_batch_inference_correctness(
         max_loras=1,
         max_cpu_loras=1,
         max_lora_rank=16,
-    )
-    lora_spec_outputs = lora_spec_llm.generate(prompts, sampling_params, lora_request=lora_request)
-    del lora_spec_llm
+    ) as vllm_model:
+        lora_spec_llm = vllm_model.model
+        lora_spec_outputs = lora_spec_llm.generate(prompts, sampling_params, lora_request=lora_request)
 
     matches = 0
     misses = 0

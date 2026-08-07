@@ -7,7 +7,7 @@ import vllm
 import vllm.config
 from vllm.lora.request import LoRARequest
 
-from tests.e2e.conftest import VllmRunner
+from tests.e2e.conftest import VllmRunner, wait_until_npu_memory_free
 from vllm_ascend.utils import enable_custom_op
 
 enable_custom_op()
@@ -126,8 +126,9 @@ def generate_and_test(llm, llama32_lora_files, tensorizer_config_dict: dict | No
 
 
 @patch.dict("os.environ", {"VLLM_USE_MODELSCOPE": "False"})
+@wait_until_npu_memory_free()
 def test_llama_lora(llama32_lora_files):
-    vllm_model = VllmRunner(
+    with VllmRunner(
         MODEL_PATH,
         enable_lora=True,
         # also test odd max_num_seqs
@@ -135,6 +136,6 @@ def test_llama_lora(llama32_lora_files):
         max_model_len=1024,
         max_loras=4,
         compilation_config={"cudagraph_mode": "PIECEWISE"},
-    )
-    llm = vllm_model.model
-    generate_and_test(llm, llama32_lora_files)
+    ) as vllm_model:
+        llm = vllm_model.model
+        generate_and_test(llm, llama32_lora_files)
