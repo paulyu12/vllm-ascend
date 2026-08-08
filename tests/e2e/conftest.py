@@ -1901,6 +1901,7 @@ def ilama_lora_files():
 
 @pytest.fixture(scope="session")
 def llama32_lora_files():
+    return "/data1/models/llama32-3b-text2sql-spider"
     from huggingface_hub import snapshot_download as hf_snapshot_download
 
     return hf_snapshot_download(repo_id="jeeejeee/llama32-3b-text2sql-spider", local_files_only=True)

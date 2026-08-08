@@ -39,7 +39,7 @@ EXPECTED_BASE_MODEL_OUTPUT = [
 ]
 
 # For hk region, we need to use the model from hf to avoid the network issue
-MODEL_PATH = "meta-llama/Llama-3.2-3B-Instruct"
+MODEL_PATH = "/data1/models/Llama-3.2-3B-Instruct"
 
 
 def do_sample(

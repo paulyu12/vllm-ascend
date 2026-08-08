@@ -11,11 +11,11 @@ from vllm_ascend.utils import enable_custom_op
 
 enable_custom_op()
 
-MODEL_PATH = "Qwen/Qwen3-0.6B"
+MODEL_PATH = "/data1/models/Qwen3-0.6B"
 LORA_NAME_PATH_MAP = {
-    "Alice": "charent/self_cognition_Alice",
-    "Bob": "charent/self_cognition_Bob",
-    "Cat": "charent/self_cognition_Bob",  # same as Bob
+    "Alice": "/data1/models/charent/self_cognition_Alice",
+    "Bob": "/data1/models/charent/self_cognition_Bob",
+    "Cat": "/data1/models/charent/self_cognition_Bob",  # same as Bob
 }
 
 LORA_RANK = 8
@@ -34,7 +34,7 @@ def format_chatml_messages(prompt: str):
     ]
 
 
-@pytest.mark.e2e_model("Qwen/Qwen3-0.6B")
+@pytest.mark.e2e_model("/data1/models/Qwen3-0.6B")
 @pytest.mark.e2e_coverage(
     arch="dense",
     feature="lora,multi_lora,runtime_lora",

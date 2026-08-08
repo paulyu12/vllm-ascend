@@ -15,7 +15,7 @@ from tests.e2e.conftest import VllmRunner, wait_until_npu_memory_free
 
 LORA_TEST_PROMPT_MAP: dict[str, str] = {}
 
-LORA_TEST_PROMPT_MAP["vllm-ascend/qwen-linear-algebra-coder"] = """
+LORA_TEST_PROMPT_MAP["/data1/models/qwen-linear-algebra-coder"] = """
 ### INSTRUCTION:
 You are an AI assistant that generates Python code to solve linear
 algebra problems.
@@ -40,9 +40,9 @@ SEED = 42
     [
         (
             "eagle3",
-            "Qwen/Qwen3-1.7B",
-            "vllm-ascend/Qwen3-1.7B_eagle3",
-            "vllm-ascend/qwen-linear-algebra-coder",
+            "/data1/models/Qwen3-1.7B",
+            "/data1/models/Qwen3-1.7B_eagle3",
+            "/data1/models/qwen-linear-algebra-coder",
             1,
         )
     ],
